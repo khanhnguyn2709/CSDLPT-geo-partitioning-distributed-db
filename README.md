@@ -87,7 +87,6 @@ geo-db/
 │   │
 │   ├── scripts/
 │   │   ├── benchmark.js
-│   │   ├── seed.js
 │   │   └── verifyConsistency.js
 │   │
 │   └── shared/
