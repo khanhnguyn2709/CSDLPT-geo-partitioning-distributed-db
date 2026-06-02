@@ -4,11 +4,7 @@ function startTimer() {
 
 function endTimer(start, label) {
   const elapsed = Date.now() - start;
-
   console.log(`[METRIC] ${label}: ${elapsed} ms`);
 }
 
-module.exports = {
-  startTimer,
-  endTimer,
-};
+module.exports = { startTimer, endTimer };

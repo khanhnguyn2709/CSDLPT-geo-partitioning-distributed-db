@@ -20,11 +20,11 @@ async function verify(id) {
     } catch {}
   }
 
-  if (count === 1) {
-    console.log("[CONSISTENCY] OK");
-  } else {
-    console.log("[CONSISTENCY] FAILED");
-  }
+  console.log(
+    count === 1
+      ? `[CONSISTENCY] OK — driver ${id} on 1 shard`
+      : `[CONSISTENCY] FAILED — driver ${id} found on ${count} shards`,
+  );
 }
 
 verify(101);

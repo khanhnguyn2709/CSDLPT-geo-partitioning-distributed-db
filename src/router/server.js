@@ -2,13 +2,10 @@ const express = require("express");
 const axios = require("axios");
 
 const resolveShard = require("./routing");
-
 const db = require("./db");
-
 const rollback = require("./recovery");
 
 const SHARDS = require("../shared/shardConfig");
-
 const log = require("../shared/logger");
 
 const { startTimer, endTimer } = require("./metrics");
@@ -39,6 +36,11 @@ function getMetadata(id) {
       `,
       [id],
       (_, row) => {
+        log(
+          "ROUTER",
+          `Lookup ${id} -> ${row ? row.CurrentShard : "not found"}`,
+        );
+
         resolve(row);
       },
     );
@@ -54,7 +56,7 @@ async function retryRequest(fn, retries = 3) {
         throw err;
       }
 
-      log("RETRY", `Attempt ${i + 1}`);
+      log("RETRY", `Attempt ${i + 1}/${retries}`);
     }
   }
 }
@@ -62,9 +64,9 @@ async function retryRequest(fn, retries = 3) {
 async function migrate(driver, oldShard, newShard) {
   const migrationStart = startTimer();
 
-  let copied = false;
+  log("MIGRATION", `Driver ${driver.DriverID}: ${oldShard} -> ${newShard}`);
 
-  log("MIGRATION", `${driver.DriverID}: ${oldShard} -> ${newShard}`);
+  log("MIGRATION", "[STEP 1/4] Copy to target shard");
 
   await retryRequest(() =>
     axios.post(`${SHARDS[newShard]}/write`, driver, {
@@ -72,11 +74,13 @@ async function migrate(driver, oldShard, newShard) {
     }),
   );
 
-  copied = true;
+  log("MIGRATION", `${driver.DriverID} copied to ${newShard}`);
 
   if (FAIL_AFTER_COPY) {
     throw new Error("Simulated crash after copy");
   }
+
+  log("MIGRATION", "[STEP 2/4] Verify copied data");
 
   const verify = await axios.get(
     `${SHARDS[newShard]}/driver/${driver.DriverID}`,
@@ -89,19 +93,32 @@ async function migrate(driver, oldShard, newShard) {
     throw new Error("Verification failed");
   }
 
+  log("VERIFY", `${driver.DriverID} confirmed on ${newShard}`);
+
+  log("MIGRATION", "[STEP 3/4] Update metadata");
+
   updateMetadata(driver.DriverID, newShard);
+
+  log(
+    "MIGRATION",
+    `Metadata updated: Driver ${driver.DriverID} moved from ${oldShard} to ${newShard}`,
+  );
+
+  log("MIGRATION", "[STEP 4/4] Delete stale copy");
 
   await axios.delete(`${SHARDS[oldShard]}/driver/${driver.DriverID}`, {
     timeout: 2000,
   });
 
-  endTimer(migrationStart, "Migration time");
+  log("MIGRATION", `Deleted stale copy from ${oldShard}`);
 
-  return copied;
+  endTimer(migrationStart, "Migration time");
 }
 
 app.post("/toggleFailure", (_, res) => {
   FAIL_AFTER_COPY = !FAIL_AFTER_COPY;
+
+  log("ROUTER", `FAIL_AFTER_COPY = ${FAIL_AFTER_COPY}`);
 
   res.send({
     FAIL_AFTER_COPY,
@@ -115,14 +132,18 @@ app.post("/updateLocation", async (req, res) => {
 
   const target = resolveShard(driver.City);
 
+  log("ROUTER", `City ${driver.City} mapped to shard ${target}`);
+
   const existing = await getMetadata(driver.DriverID);
 
-  let copied = false;
-
   try {
+    log("ROUTER", `Health check ${target}`);
+
     await axios.get(`${SHARDS[target]}/health`, {
       timeout: 2000,
     });
+
+    log("ROUTER", `${target} shard alive`);
 
     if (!existing) {
       await retryRequest(() =>
@@ -135,13 +156,15 @@ app.post("/updateLocation", async (req, res) => {
 
       log("ROUTER", `Inserted ${driver.DriverID} -> ${target}`);
     } else if (existing.CurrentShard !== target) {
-      copied = await migrate(driver, existing.CurrentShard, target);
+      await migrate(driver, existing.CurrentShard, target);
     } else {
       await retryRequest(() =>
         axios.post(`${SHARDS[target]}/write`, driver, {
           timeout: 2000,
         }),
       );
+
+      log("ROUTER", `Updated ${driver.DriverID} on ${target}`);
     }
 
     endTimer(routingStart, "Routing latency");
@@ -151,10 +174,19 @@ app.post("/updateLocation", async (req, res) => {
       target,
     });
   } catch (err) {
-    if (copied) {
+    if (FAIL_AFTER_COPY) {
       const recoveryStart = startTimer();
 
+      log(
+        "RECOVERY",
+        "Failure detected - system chooses Availability and Partition Tolerance before immediate Consistency",
+      );
+
+      log("RECOVERY", `Rollback start for Driver ${driver.DriverID}`);
+
       await rollback(driver.DriverID, target);
+
+      log("RECOVERY", `Rollback completed for Driver ${driver.DriverID}`);
 
       endTimer(recoveryStart, "Recovery time");
     }
@@ -168,6 +200,8 @@ app.post("/updateLocation", async (req, res) => {
 });
 
 app.get("/driver/:id", async (req, res) => {
+  const queryStart = startTimer();
+
   const meta = await getMetadata(req.params.id);
 
   if (!meta) {
@@ -176,12 +210,16 @@ app.get("/driver/:id", async (req, res) => {
     });
   }
 
+  log("ROUTER", `Query ${req.params.id} -> ${meta.CurrentShard}`);
+
   const result = await axios.get(
     `${SHARDS[meta.CurrentShard]}/driver/${req.params.id}`,
     {
       timeout: 2000,
     },
   );
+
+  endTimer(queryStart, "Query response time");
 
   res.send(result.data);
 });
